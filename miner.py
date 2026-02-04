@@ -38,128 +38,9 @@ from molecules import (
 DB_PATH = str(Path(nova_ph2.__file__).resolve().parent / "combinatorial_db" / "molecules.sqlite")
 
 
-# PHASE 2: Reaction-specific configurations for optimal performance
-REACTION_CONFIGS = {
-    1: {
-        'base_samples': 1200,       # 2-comp, fast reaction
-        'elite_frac': 0.70,
-        'mutation_prob': 0.20,
-        'synthon_ratio': 0.75,
-        'exploit_start_iter': 3,
-        'first_iter_mult': 6
-    },
-    2: {
-        'base_samples': 1100,       # 2-comp, moderate
-        'elite_frac': 0.75,
-        'mutation_prob': 0.15,
-        'synthon_ratio': 0.78,
-        'exploit_start_iter': 3,
-        'first_iter_mult': 6
-    },
-    3: {
-        'base_samples': 800,        # 3-comp, slower
-        'elite_frac': 0.65,
-        'mutation_prob': 0.25,
-        'synthon_ratio': 0.70,
-        'exploit_start_iter': 4,
-        'first_iter_mult': 5
-    },
-    4: {
-        'base_samples': 1150,       # 2-comp
-        'elite_frac': 0.72,
-        'mutation_prob': 0.18,
-        'synthon_ratio': 0.76,
-        'exploit_start_iter': 3,
-        'first_iter_mult': 6
-    },
-    5: {
-        'base_samples': 750,        # 3-comp, slowest
-        'elite_frac': 0.68,
-        'mutation_prob': 0.22,
-        'synthon_ratio': 0.68,
-        'exploit_start_iter': 4,
-        'first_iter_mult': 4
-    },
-    6: {
-        'base_samples': 1200,       # 2-comp, fast
-        'elite_frac': 0.75,
-        'mutation_prob': 0.15,
-        'synthon_ratio': 0.78,
-        'exploit_start_iter': 3,
-        'first_iter_mult': 6
-    }
-}
-
-
 target_models = []
 antitarget_models = []
 exploit_worker_process = None
-
-# PHASE 3: Memory Management - DataFrame Pool
-class DataFramePool:
-    """PHASE 3: Object pool for DataFrame reuse to reduce allocations."""
-    def __init__(self, pool_size=10):
-        self.pool = []
-        self.pool_size = pool_size
-        
-    def acquire(self):
-        """Get a DataFrame from pool or create new one."""
-        if self.pool:
-            df = self.pool.pop()
-            return df
-        return pd.DataFrame()
-    
-    def release(self, df):
-        """Return DataFrame to pool after clearing it."""
-        if len(self.pool) < self.pool_size:
-            try:
-                df.drop(df.index, inplace=True)  # Clear data
-                self.pool.append(df)
-            except:
-                pass  # If error, just discard
-
-# Global DataFrame pool
-_dataframe_pool = DataFramePool(pool_size=20)
-
-
-def load_warm_start_molecules(rxn_id: int) -> pd.DataFrame:
-    """
-    PHASE 3: Load previously successful molecules for this reaction as warm start.
-    """
-    warm_start_file = os.path.join(OUTPUT_DIR, f"warm_start_rxn{rxn_id}.json")
-    try:
-        if os.path.exists(warm_start_file):
-            with open(warm_start_file) as f:
-                data = json.load(f)
-            if 'molecules' in data and data['molecules']:
-                df = pd.DataFrame(data['molecules'])
-                bt.logging.info(f"[WarmStart] Loaded {len(df)} molecules from previous run for rxn:{rxn_id}")
-                return df
-    except Exception as e:
-        bt.logging.warning(f"[WarmStart] Could not load warm start data: {e}")
-    return pd.DataFrame()
-
-
-def save_warm_start_molecules(rxn_id: int, top_molecules: pd.DataFrame):
-    """
-    PHASE 3: Save top molecules for future runs as warm start.
-    """
-    if top_molecules.empty:
-        return
-    
-    warm_start_file = os.path.join(OUTPUT_DIR, f"warm_start_rxn{rxn_id}.json")
-    try:
-        top_20 = top_molecules.head(20)[["name", "smiles", "InChIKey", "score"]].copy()
-        data = {
-            'molecules': top_20.to_dict('records'),
-            'timestamp': time.time(),
-            'rxn_id': rxn_id
-        }
-        with open(warm_start_file, 'w') as f:
-            json.dump(data, f, indent=2)
-        bt.logging.info(f"[WarmStart] Saved {len(top_20)} molecules for future runs")
-    except Exception as e:
-        bt.logging.warning(f"[WarmStart] Could not save warm start data: {e}")
 
 
 def spawn_exploit_worker():
@@ -406,128 +287,18 @@ def select_diverse_subset(pool, top_95_smiles, subset_size=5, entropy_threshold=
     return pd.DataFrame()
 
 
-def dynamic_batch_size(iteration: int, time_remaining: float, current_score: float, base_batch: int = 400) -> int:
-    """
-    PHASE 2: Dynamic batch sizing based on time, score, and iteration.
-    Returns optimal batch size for current situation.
-    """
-    # Base multiplier from time remaining
-    if time_remaining > 1500:      # 25분 이상
-        time_mult = 1.0
-    elif time_remaining > 900:     # 15분 이상
-        time_mult = 0.95
-    elif time_remaining > 600:     # 10분 이상
-        time_mult = 0.90
-    else:                          # 10분 미만
-        time_mult = 0.85
-    
-    # Score-based adjustment
-    if current_score > 0.015:
-        score_mult = 0.9  # High score: smaller batches for focused exploitation
-    elif current_score > 0.010:
-        score_mult = 1.0  # Medium score: normal batch size
-    else:
-        score_mult = 1.1  # Low score: larger batches for more exploration
-    
-    # Iteration-based (early iterations need more exploration)
-    if iteration <= 3:
-        iter_mult = 1.2
-    elif iteration <= 10:
-        iter_mult = 1.0
-    else:
-        iter_mult = 0.95
-    
-    batch_size = int(base_batch * time_mult * score_mult * iter_mult)
-    return max(300, min(600, batch_size))  # Clamp between 300-600
-
-
-def adaptive_strategy(top_pool: pd.DataFrame, iteration: int, time_remaining: float, rxn_config: dict) -> dict:
-    """
-    PHASE 2: Adaptive strategy based on current scores and situation.
-    Returns strategy parameters to use for this iteration.
-    """
-    if top_pool.empty:
-        return {
-            'mode': 'explore',
-            'n_samples_mult': 1.2,
-            'similarity': 0.55,
-            'n_per_base': 30,
-            'elite_frac': 0.60
-        }
-    
-    current_max = top_pool['score'].max()
-    current_avg = top_pool['score'].mean()
-    
-    # Very High Score: Ultra-tight exploitation
-    if current_max > 0.018:
-        bt.logging.info(f"[Adaptive] Ultra-exploit mode (max={current_max:.4f})")
-        return {
-            'mode': 'ultra_exploit',
-            'n_samples_mult': 0.8,
-            'similarity': 0.93,
-            'n_per_base': 120,
-            'elite_frac': 0.85
-        }
-    
-    # High Score: Tight exploitation
-    elif current_max > 0.012:
-        bt.logging.info(f"[Adaptive] Tight-exploit mode (max={current_max:.4f})")
-        return {
-            'mode': 'tight_exploit',
-            'n_samples_mult': 0.9,
-            'similarity': 0.85,
-            'n_per_base': 80,
-            'elite_frac': 0.78
-        }
-    
-    # Medium Score: Balanced
-    elif current_max > 0.008:
-        bt.logging.info(f"[Adaptive] Balanced mode (max={current_max:.4f})")
-        return {
-            'mode': 'balanced',
-            'n_samples_mult': 1.0,
-            'similarity': 0.70,
-            'n_per_base': 50,
-            'elite_frac': 0.72
-        }
-    
-    # Low Score: Explore more
-    else:
-        bt.logging.info(f"[Adaptive] Explore mode (max={current_max:.4f})")
-        return {
-            'mode': 'explore',
-            'n_samples_mult': 1.2,
-            'similarity': 0.55,
-            'n_per_base': 30,
-            'elite_frac': rxn_config.get('elite_frac', 0.60)
-        }
-
-
 def main(config: dict):
     # WINNING MODEL: Combines best of richard1220v3 (balanced) + patarcom1 (exploration) + smart adaptations
     # Target: Beat richard1220v3 (0.0124) by 0.05+ to reach 0.0174+
     print(f"[Miner] main() started, rxn={config['allowed_reaction']}", flush=True)
-    
-    # PHASE 2: Get reaction-specific configuration
-    rxn_id = int(config["allowed_reaction"].split(":")[-1])
-    rxn_config = REACTION_CONFIGS.get(rxn_id, REACTION_CONFIGS[1])  # Default to rxn:1 if not found
-    
-    base_n_samples = rxn_config['base_samples']  # PHASE 2: Reaction-specific
-    mutation_prob = rxn_config['mutation_prob']  # PHASE 2: Reaction-specific
-    elite_frac = rxn_config['elite_frac']  # PHASE 2: Reaction-specific
-    exploit_start_iter = rxn_config['exploit_start_iter']  # PHASE 2: Reaction-specific
-    
-    print(f"[Miner] rxn_id={rxn_id}, base_samples={base_n_samples}, elite_frac={elite_frac}, mutation={mutation_prob} [PHASE 2]", flush=True)
-    
+    base_n_samples = 800  # Optimized: proven pattern for high scores (more iterations, faster learning)
     top_pool = pd.DataFrame(columns=["name", "smiles", "InChIKey", "score", "Target", "Anti"])
+    rxn_id = int(config["allowed_reaction"].split(":")[-1])
+    print(f"[Miner] rxn_id={rxn_id}", flush=True)
     iteration = 0
 
-    # PHASE 3: Load warm start molecules
-    warm_start_df = load_warm_start_molecules(rxn_id)
-    if not warm_start_df.empty:
-        # Add warm start molecules to initial pool
-        top_pool = pd.concat([top_pool, warm_start_df], ignore_index=True)
-        bt.logging.info(f"[PHASE 3] Warm start: {len(warm_start_df)} molecules loaded")
+    mutation_prob = 0.25
+    elite_frac = 0.75
 
     seen_inchikeys = set()
     seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
@@ -544,56 +315,41 @@ def main(config: dict):
     best_molecules_history = []
     max_score_history = []
 
-    # PHASE 2: Reaction-specific first iteration boost
-    n_samples_first_iteration = base_n_samples * rxn_config['first_iter_mult']
+    # Enhanced first iteration - good exploration
+    n_samples_first_iteration = base_n_samples * 4 if config["allowed_reaction"] != "rxn:5" else base_n_samples * 2
 
-    # PHASE 2: Reaction-specific exploit worker spawn time
+    # Delay exploit worker spawn until after iteration 4 (let good molecules rise)
     exploit_worker_spawned = False
-    print(f"[Miner] Entering main loop (exploit worker will start after iteration {exploit_start_iter}) [PHASE 2]", flush=True)
+    print(f"[Miner] Entering main loop (exploit worker will start after iteration 4)...", flush=True)
 
-    # PHASE 1 OPTIMIZATION: Increased CPU workers from 2 to 4 for better parallelization
-    with ProcessPoolExecutor(max_workers=4) as cpu_executor:
+    # Use single CPU worker - proven pattern reduces overhead, improves stability
+    with ProcessPoolExecutor(max_workers=2) as cpu_executor:
         while time.time() - start < 1800:
             iteration += 1
             iter_start_time = time.time()
             print(f"[Miner] === Starting iteration {iteration} ===", flush=True)
 
-            # PHASE 2: Reaction-specific exploit worker spawn
-            if iteration == exploit_start_iter and not exploit_worker_spawned:
+            # Spawn exploit worker after iteration 4
+            if iteration == 4 and not exploit_worker_spawned:
                 spawn_exploit_worker()
                 exploit_worker_spawned = True
-                print(f"[Miner] Exploit worker spawned after iteration {exploit_start_iter} (PHASE 2 - Reaction-specific)", flush=True)
+                print(f"[Miner] Exploit worker spawned after iteration 4", flush=True)
 
-            # PHASE 2: Adaptive strategy based on scores and time
+            # Adaptive n_samples: maintain good throughput
             remaining_time = 1800 - (time.time() - start)
-            adaptive_params = adaptive_strategy(top_pool, iteration, remaining_time, rxn_config)
-            
-            # Apply adaptive parameters
-            n_samples_mult = adaptive_params['n_samples_mult']
-            adaptive_elite_frac = adaptive_params['elite_frac']
-            
-            # Time-based adjustment (keep some time pressure)
             if remaining_time > 1500:
-                time_mult = 1.0
+                n_samples = base_n_samples
             elif remaining_time > 900:
-                time_mult = 0.95
+                n_samples = int(base_n_samples * 0.95)
             elif remaining_time > 600:
-                time_mult = 0.90
+                n_samples = int(base_n_samples * 0.90)
             elif remaining_time > 300:
-                time_mult = 0.85
+                n_samples = int(base_n_samples * 0.85)
             else:
-                time_mult = 0.80
-            
-            n_samples = int(base_n_samples * n_samples_mult * time_mult)
-            
-            # PHASE 2: Dynamic batch size
-            current_max_score = top_pool['score'].max() if not top_pool.empty else 0.0
-            dynamic_batch = dynamic_batch_size(iteration, remaining_time, current_max_score, base_batch=400)
-            
-            bt.logging.info(f"[Miner] Adaptive mode: {adaptive_params['mode']}, n_samples={n_samples}, batch_size={dynamic_batch}")
+                n_samples = int(base_n_samples * 0.80)
 
             # Build synthon library after first iteration
-            if iteration == 2 and not top_pool.empty and synthon_lib is None:
+            if iteration == 4 and not top_pool.empty and synthon_lib is None:
                 try:
                     bt.logging.info("[Miner] Building synthon library from top molecules...")
                     synthon_lib_start = time.time()
@@ -605,8 +361,8 @@ def main(config: dict):
                     use_synthon_search = False
 
             component_weights = build_component_weights(top_pool, rxn_id) if not top_pool.empty else None
-            # Enhanced elite pool - PHASE 1 OPTIMIZATION: Increased from 150 to 200
-            elite_df = select_diverse_elites(top_pool, min(200, len(top_pool))) if not top_pool.empty else pd.DataFrame()
+            # Enhanced elite pool
+            elite_df = select_diverse_elites(top_pool, min(150, len(top_pool))) if not top_pool.empty else pd.DataFrame()
             elite_names = elite_df["name"].tolist() if not elite_df.empty else None
 
             # WINNING STRATEGY: Intelligent exploration/exploitation balance
@@ -676,16 +432,16 @@ def main(config: dict):
                     # SMART: Adjust strategy based on absolute score and time
                     if has_very_high_score or is_very_late_stage:
                         # When we have very high scores, add focused exploitation on TOP 1
-                        # Part 1: Ultra-tight on TOP 1 molecule - PHASE 1 OPTIMIZATION
-                        n_synthon_top1 = int(n_samples * 0.30)  # PHASE 1: Increased from 0.25 to 0.30
+                        # Part 1: Ultra-tight on TOP 1 molecule (30% of synthon budget) - OPTIMIZED for high scores
+                        n_synthon_top1 = int(n_samples * 0.25)  # Increased from 0.21 to 0.30 for maximum exploitation
                         synthon_top1_df = generate_molecules_from_synthon_library(
                             synthon_lib,
                             top_pool.head(1),  # TOP 1 ONLY
                             n_synthon_top1,
-                            min_similarity=0.92,  # PHASE 1: Increased from 0.91 to 0.92 for even tighter similarity
-                            n_per_base=100  # PHASE 1: Increased from 50 to 100 for maximum variations
+                            min_similarity=0.91,  # Increased from 0.85 to 0.90 for ultra-tight similarity
+                            n_per_base=50  # Increased from 50 to 80 for maximum variations
                         )
-                        bt.logging.info(f"[Miner] Generated {len(synthon_top1_df)} TOP-1 synthon candidates (sim=0.92, n_per_base=100) [PHASE 1]")
+                        bt.logging.info(f"[Miner] Generated {len(synthon_top1_df)} TOP-1 synthon candidates (sim=0.90, n_per_base=80)")
 
                         # Part 2: Ultra-tight on top 5 molecules (10% of synthon budget)
                         n_synthon_tight = int(n_samples * 0.07)  # 10% of 70%
@@ -776,9 +532,9 @@ def main(config: dict):
                             n_samples=n_traditional,
                             db_path=DB_PATH,
                             subnet_config=config,
-                            batch_size=dynamic_batch,  # PHASE 2: Dynamic batch size
+                            batch_size=400,
                             elite_names=elite_names,
-                            elite_frac=adaptive_elite_frac,  # PHASE 2: Adaptive elite fraction
+                            elite_frac=elite_frac,
                             mutation_prob=mutation_prob,
                             avoid_inchikeys=seen_inchikeys,
                             component_weights=component_weights,
@@ -814,9 +570,9 @@ def main(config: dict):
                             n_samples=n_traditional,
                             db_path=DB_PATH,
                             subnet_config=config,
-                            batch_size=dynamic_batch,  # PHASE 2: Dynamic batch size
+                            batch_size=300,
                             elite_names=elite_names,
-                            elite_frac=adaptive_elite_frac,  # PHASE 2: Adaptive elite fraction
+                            elite_frac=elite_frac,
                             mutation_prob=mutation_prob,
                             avoid_inchikeys=seen_inchikeys,
                             component_weights=component_weights,
@@ -840,9 +596,9 @@ def main(config: dict):
                     n_samples=n_samples,
                     db_path=DB_PATH,
                     subnet_config=config,
-                    batch_size=dynamic_batch,  # PHASE 2: Dynamic batch size
+                    batch_size=400,
                     elite_names=elite_names,
-                    elite_frac=adaptive_elite_frac,  # PHASE 2: Adaptive elite fraction
+                    elite_frac=elite_frac,
                     mutation_prob=mutation_prob,
                     avoid_inchikeys=seen_inchikeys,
                     component_weights=component_weights,
@@ -1105,9 +861,6 @@ def main(config: dict):
             with open(os.path.join(OUTPUT_DIR, "result.json"), "w") as f:
                 json.dump(top_entries, f, ensure_ascii=False, indent=2)
 
-    # PHASE 3: Save warm start for future runs
-    save_warm_start_molecules(rxn_id, top_pool)
-    
     # Cleanup: stop exploit worker
     stop_exploit_worker()
 
