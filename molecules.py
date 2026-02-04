@@ -10,14 +10,8 @@ import random
 import os
 from functools import lru_cache
 from typing import List, Tuple, Dict
-import pickle
-import hashlib
 load_dotenv(override=True)
 warnings.filterwarnings("ignore", category=pd.errors.SettingWithCopyWarning)
-
-# PHASE 3: Persistent disk cache directory
-CACHE_DIR = os.environ.get("NOVA_CACHE_DIR", "/tmp/nova_cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
 from nova_ph2.combinatorial_db.reactions import get_smiles_from_reaction, get_reaction_info
 from nova_ph2.utils.molecules import get_heavy_atom_count
 from collections import defaultdict
@@ -37,51 +31,15 @@ except ImportError:
 MORGAN_FP_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 
 
-def _get_cache_path(key: str, cache_type: str = "smiles") -> str:
-    """PHASE 3: Get disk cache file path for a key."""
-    key_hash = hashlib.md5(key.encode()).hexdigest()
-    return os.path.join(CACHE_DIR, f"{cache_type}_{key_hash[:8]}.pkl")
-
-def _load_from_disk_cache(cache_path: str):
-    """PHASE 3: Load from disk cache."""
-    try:
-        if os.path.exists(cache_path):
-            with open(cache_path, 'rb') as f:
-                return pickle.load(f)
-    except Exception:
-        pass
-    return None
-
-def _save_to_disk_cache(cache_path: str, value):
-    """PHASE 3: Save to disk cache."""
-    try:
-        with open(cache_path, 'wb') as f:
-            pickle.dump(value, f, protocol=pickle.HIGHEST_PROTOCOL)
-    except Exception:
-        pass
-
-@lru_cache(maxsize=5_000_000)  # PHASE 1: Increased from 1M to 5M for better caching
+@lru_cache(maxsize=1000_000)
 def _get_smiles_from_reaction_cached(name: str):
-    """
-    PHASE 3: Cache SMILES with disk persistence.
-    Memory cache first, disk cache fallback.
-    """
+    """Cache SMILES retrieval to avoid repeated database queries."""
     try:
-        # Try disk cache first for persistence
-        cache_path = _get_cache_path(name, "smiles")
-        cached_value = _load_from_disk_cache(cache_path)
-        if cached_value is not None:
-            return cached_value
-        
-        # Not in cache, fetch from database
-        value = get_smiles_from_reaction(name)
-        if value:
-            _save_to_disk_cache(cache_path, value)
-        return value
+        return get_smiles_from_reaction(name)
     except Exception:
         return None
 
-@lru_cache(maxsize=5_000_000)  # PHASE 1: Increased from 1M to 5M for better caching
+@lru_cache(maxsize=1000_000)
 def _mol_from_smiles_cached(smiles: str):
     """Cache molecule parsing to avoid repeated SMILES parsing."""
     if not smiles:
@@ -92,7 +50,7 @@ def _mol_from_smiles_cached(smiles: str):
         return None
 
 
-@lru_cache(maxsize=5_000_000)  # PHASE 1: Increased from 1M to 5M for better caching
+@lru_cache(maxsize=1000_000)
 def _maccs_fp_from_smiles_cached(smiles: str):
     """Cache MACCS fingerprints for SMILES strings for fast Tanimoto similarity."""
     if not smiles:
@@ -105,7 +63,7 @@ def _maccs_fp_from_smiles_cached(smiles: str):
     except Exception:
         return None
 
-@lru_cache(maxsize=5_000_000)  # PHASE 1: Increased from 1M to 5M for better caching
+@lru_cache(maxsize=1000_000)
 def _inchikey_from_name_cached(name: str) -> str:
     """Cache InChIKey generation from molecule name to avoid repeated computation."""
     try:
@@ -153,7 +111,7 @@ def num_rotatable_bonds(smiles: str) -> int:
     except Exception:
         return 0
 
-@lru_cache(maxsize=5_000_000)  # PHASE 1: Increased from 1M to 5M for better caching
+@lru_cache(maxsize=1000_000)
 def generate_inchikey(smiles: str) -> str:
     """Generate InChIKey from SMILES string."""
     if not smiles:
@@ -173,7 +131,6 @@ def compute_tanimoto_similarity_to_pool(
     pool_smiles: pd.Series,
 ) -> pd.Series:
     """
-    PHASE 3: Optimized with bulk similarity computation.
     Compute, for each candidate SMILES, the maximum MACCS Tanimoto similarity
     to any molecule in the reference pool.
 
@@ -199,22 +156,14 @@ def compute_tanimoto_similarity_to_pool(
         if fp_cand is None:
             similarities[idx] = 0.0
             continue
-        
-        # PHASE 3: Use bulk similarity if available (faster)
-        try:
-            sims = DataStructs.BulkTanimotoSimilarity(fp_cand, pool_fps)
-            max_sim = max(sims) if sims else 0.0
-        except Exception:
-            # Fallback to individual comparisons
-            max_sim = 0.0
-            for fp_ref in pool_fps:
-                try:
-                    sim = DataStructs.TanimotoSimilarity(fp_cand, fp_ref)
-                except Exception:
-                    sim = 0.0
-                if sim > max_sim:
-                    max_sim = sim
-        
+        max_sim = 0.0
+        for fp_ref in pool_fps:
+            try:
+                sim = DataStructs.TanimotoSimilarity(fp_cand, fp_ref)
+            except Exception:
+                sim = 0.0
+            if sim > max_sim:
+                max_sim = sim
         similarities[idx] = float(max_sim)
 
     return pd.Series(similarities, dtype=float)
@@ -348,50 +297,22 @@ def validate_molecules(data: pd.DataFrame, config: dict) -> pd.DataFrame:
     return data
 
 
-# PHASE 3: Database connection pool
-_db_connection_cache = {}
-
-def _get_db_connection(db_path: str):
-    """PHASE 3: Get cached database connection."""
-    if db_path not in _db_connection_cache:
-        abs_db_path = os.path.abspath(db_path)
-        conn = sqlite3.connect(f"file:{abs_db_path}?mode=ro&immutable=1", uri=True)
-        conn.execute("PRAGMA query_only = ON")
-        conn.execute("PRAGMA cache_size = -64000")  # 64MB cache
-        conn.execute("PRAGMA temp_store = MEMORY")
-        _db_connection_cache[db_path] = conn
-    return _db_connection_cache[db_path]
-
 @lru_cache(maxsize=None)
 def get_molecules_by_role(role_mask: int, db_path: str) -> List[Tuple[int, str, int]]:
-    """PHASE 3: Optimized with connection pooling and better PRAGMA settings."""
     try:
-        conn = _get_db_connection(db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT mol_id, smiles, role_mask FROM molecules WHERE (role_mask & ?) = ?",
-            (role_mask, role_mask)
-        )
-        results = cursor.fetchall()
+        abs_db_path = os.path.abspath(db_path)
+        with sqlite3.connect(f"file:{abs_db_path}?mode=ro&immutable=1", uri=True) as conn:
+            conn.execute("PRAGMA query_only = ON")
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT mol_id, smiles, role_mask FROM molecules WHERE (role_mask & ?) = ?",
+                (role_mask, role_mask)
+            )
+            results = cursor.fetchall()
         return results
     except Exception as e:
         bt.logging.error(f"Error getting molecules by role {role_mask}: {e}")
         return []
-
-def batch_get_molecules(mol_ids: List[int], db_path: str) -> Dict[int, str]:
-    """PHASE 3: Batch query for multiple molecules."""
-    try:
-        conn = _get_db_connection(db_path)
-        cursor = conn.cursor()
-        placeholders = ','.join('?' * len(mol_ids))
-        cursor.execute(
-            f"SELECT mol_id, smiles FROM molecules WHERE mol_id IN ({placeholders})",
-            mol_ids
-        )
-        return dict(cursor.fetchall())
-    except Exception as e:
-        bt.logging.error(f"Error batch getting molecules: {e}")
-        return {}
 
 
 class SynthonLibrary:
