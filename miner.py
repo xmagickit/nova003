@@ -291,14 +291,14 @@ def main(config: dict):
     # WINNING MODEL: Combines best of richard1220v3 (balanced) + patarcom1 (exploration) + smart adaptations
     # Target: Beat richard1220v3 (0.0124) by 0.05+ to reach 0.0174+
     print(f"[Miner] main() started, rxn={config['allowed_reaction']}", flush=True)
-    base_n_samples = 800  # Optimized: proven pattern for high scores (more iterations, faster learning)
+    base_n_samples = 1024  # Optimized: proven pattern for high scores (more iterations, faster learning)
     top_pool = pd.DataFrame(columns=["name", "smiles", "InChIKey", "score", "Target", "Anti"])
     rxn_id = int(config["allowed_reaction"].split(":")[-1])
     print(f"[Miner] rxn_id={rxn_id}", flush=True)
     iteration = 0
 
-    mutation_prob = 0.25
-    elite_frac = 0.75
+    mutation_prob = 0.3
+    elite_frac = 0.7
 
     seen_inchikeys = set()
     seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
@@ -323,7 +323,7 @@ def main(config: dict):
     print(f"[Miner] Entering main loop (exploit worker will start after iteration 4)...", flush=True)
 
     # Use single CPU worker - proven pattern reduces overhead, improves stability
-    with ProcessPoolExecutor(max_workers=2) as cpu_executor:
+    with ProcessPoolExecutor(max_workers=3) as cpu_executor:
         while time.time() - start < 1800:
             iteration += 1
             iter_start_time = time.time()
@@ -433,7 +433,7 @@ def main(config: dict):
                     if has_very_high_score or is_very_late_stage:
                         # When we have very high scores, add focused exploitation on TOP 1
                         # Part 1: Ultra-tight on TOP 1 molecule (30% of synthon budget) - OPTIMIZED for high scores
-                        n_synthon_top1 = int(n_samples * 0.25)  # Increased from 0.21 to 0.30 for maximum exploitation
+                        n_synthon_top1 = int(n_samples * 0.26)  # Increased from 0.21 to 0.30 for maximum exploitation
                         synthon_top1_df = generate_molecules_from_synthon_library(
                             synthon_lib,
                             top_pool.head(1),  # TOP 1 ONLY
