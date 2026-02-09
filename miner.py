@@ -4,7 +4,6 @@ os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 import sys
 import json
 import time
-import subprocess
 import argparse
 import bittensor as bt
 from concurrent.futures import ProcessPoolExecutor, TimeoutError
@@ -18,7 +17,6 @@ PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")
 sys.path.append(PARENT_DIR)
 
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/output")
-SHARED_DIR = os.path.join(OUTPUT_DIR, "shared")
 
 from nova_ph2.PSICHIC.wrapper import PsichicWrapper
 from nova_ph2.PSICHIC.psichic_utils.data_utils import virtual_screening
@@ -33,110 +31,19 @@ from molecules import (
     generate_molecules_from_synthon_library,
     validate_molecules,
     generate_inchikey,
+    run_exploit,
+    get_top_n_unexploited,
 )
 
 DB_PATH = str(Path(nova_ph2.__file__).resolve().parent / "combinatorial_db" / "molecules.sqlite")
 
+# Exploit settings (same as exploit_worker.py)
+TOP_N_EXPLOIT = 5        # Search top N molecules for unexploited reactants
+LIMIT_PER_REACTANT = 1000  # Candidates per reactant
 
 target_models = []
 antitarget_models = []
-exploit_worker_process = None
 
-
-def spawn_exploit_worker():
-    """Spawn the exploit worker as a subprocess."""
-    global exploit_worker_process
-    try:
-        os.makedirs(SHARED_DIR, exist_ok=True)
-        bt.logging.info("[Miner] Spawning exploit_worker.py subprocess...")
-        exploit_worker_path = os.path.join(BASE_DIR, "exploit_worker.py")
-        log_path = os.path.join(OUTPUT_DIR, "exploit_worker.log")
-
-        with open(log_path, "w") as log_file:
-            exploit_worker_process = subprocess.Popen(
-                [sys.executable, exploit_worker_path],
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                env={**os.environ, "OUTPUT_DIR": OUTPUT_DIR},
-                cwd=BASE_DIR
-            )
-        bt.logging.info(f"[Miner] Exploit worker started with PID {exploit_worker_process.pid}")
-    except Exception as e:
-        bt.logging.warning(f"[Miner] Failed to spawn exploit worker: {e}")
-        exploit_worker_process = None
-
-
-def stop_exploit_worker():
-    """Stop the exploit worker subprocess."""
-    global exploit_worker_process
-    if exploit_worker_process is not None:
-        try:
-            exploit_worker_process.terminate()
-            exploit_worker_process.wait(timeout=5)
-            bt.logging.info("[Miner] Exploit worker terminated")
-        except Exception as e:
-            bt.logging.warning(f"[Miner] Error stopping exploit worker: {e}")
-            try:
-                exploit_worker_process.kill()
-            except:
-                pass
-
-
-def write_top10_for_exploit_worker(top_pool: pd.DataFrame):
-    """Write top 100 molecules to shared file for exploit worker."""
-    try:
-        os.makedirs(SHARED_DIR, exist_ok=True)
-        top10_path = os.path.join(SHARED_DIR, "top10.json")
-        top10 = top_pool.head(100)[["name", "smiles", "score"]].copy()
-        top10_data = {
-            "molecules": top10.to_dict("records"),
-            "timestamp": time.time()
-        }
-        tmp_path = top10_path + ".tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(top10_data, f)
-        os.rename(tmp_path, top10_path)
-    except Exception as e:
-        bt.logging.warning(f"[Miner] Failed to write top10.json: {e}")
-
-
-def read_pool_b() -> pd.DataFrame:
-    """Read Pool B results from exploit worker."""
-    try:
-        pool_b_path = os.path.join(SHARED_DIR, "pool_b.json")
-        if not os.path.exists(pool_b_path):
-            return pd.DataFrame()
-        with open(pool_b_path) as f:
-            data = json.load(f)
-        molecules = data.get("molecules", [])
-        if not molecules:
-            return pd.DataFrame()
-        df = pd.DataFrame(molecules)
-        bt.logging.info(f"[Miner] Read {len(df)} molecules from Pool B "
-                       f"(avg={data.get('avg_score', 0):.4f}, max={data.get('max_score', 0):.4f})")
-        return df
-    except Exception as e:
-        bt.logging.warning(f"[Miner] Failed to read pool_b.json: {e}")
-        return pd.DataFrame()
-
-
-def merge_pools(pool_a: pd.DataFrame, pool_b: pd.DataFrame, config: dict) -> pd.DataFrame:
-    """Merge Pool A and Pool B, deduplicate by InChIKey, keep top num_molecules."""
-    if pool_b.empty:
-        bt.logging.info("[Miner] Pool B empty, using Pool A only")
-        return pool_a.head(config["num_molecules"])
-
-    bt.logging.info(f"[Miner] Merging Pool A ({len(pool_a)}) + Pool B ({len(pool_b)})")
-
-    if "InChIKey" not in pool_b.columns:
-        pool_b = pool_b.copy()
-        pool_b["InChIKey"] = pool_b["smiles"].apply(generate_inchikey)
-
-    combined = pd.concat([pool_a, pool_b], ignore_index=True)
-    combined = combined.sort_values(by="score", ascending=False)
-    combined = combined.drop_duplicates(subset=["InChIKey"], keep="first")
-    bt.logging.info(f"[Miner] Combined pool: {len(combined)} unique molecules")
-    return combined.head(config["num_molecules"])
 
 def parse_args():
     """Parse command line arguments."""
@@ -291,14 +198,14 @@ def main(config: dict):
     # WINNING MODEL: Combines best of richard1220v3 (balanced) + patarcom1 (exploration) + smart adaptations
     # Target: Beat richard1220v3 (0.0124) by 0.05+ to reach 0.0174+
     print(f"[Miner] main() started, rxn={config['allowed_reaction']}", flush=True)
-    base_n_samples = 1024  # Optimized: proven pattern for high scores (more iterations, faster learning)
+    base_n_samples = 800  # Optimized: proven pattern for high scores (more iterations, faster learning)
     top_pool = pd.DataFrame(columns=["name", "smiles", "InChIKey", "score", "Target", "Anti"])
     rxn_id = int(config["allowed_reaction"].split(":")[-1])
     print(f"[Miner] rxn_id={rxn_id}", flush=True)
     iteration = 0
 
-    mutation_prob = 0.3
-    elite_frac = 0.7
+    mutation_prob = 0.25
+    elite_frac = 0.75
 
     seen_inchikeys = set()
     seed_df = pd.DataFrame(columns=["name", "smiles", "InChIKey", "tanimoto_similarity"])
@@ -318,22 +225,25 @@ def main(config: dict):
     # Enhanced first iteration - good exploration
     n_samples_first_iteration = base_n_samples * 4 if config["allowed_reaction"] != "rxn:5" else base_n_samples * 2
 
-    # Delay exploit worker spawn until after iteration 4 (let good molecules rise)
-    exploit_worker_spawned = False
-    print(f"[Miner] Entering main loop (exploit worker will start after iteration 4)...", flush=True)
+    # Exploit mode tracking (for inline exploit after iteration 4)
+    use_exploit_mode = False
+    seen_names = set()  # Track all molecule names for exploit
+    exploited_reactants = set()  # Track which reactants have been exploited
+    print(f"[Miner] Entering main loop (exploit mode starts at iteration 15)...", flush=True)
 
     # Use single CPU worker - proven pattern reduces overhead, improves stability
-    with ProcessPoolExecutor(max_workers=3) as cpu_executor:
+    with ProcessPoolExecutor(max_workers=2) as cpu_executor:
         while time.time() - start < 1800:
             iteration += 1
             iter_start_time = time.time()
             print(f"[Miner] === Starting iteration {iteration} ===", flush=True)
 
-            # Spawn exploit worker after iteration 4
-            if iteration == 4 and not exploit_worker_spawned:
-                spawn_exploit_worker()
-                exploit_worker_spawned = True
-                print(f"[Miner] Exploit worker spawned after iteration 4", flush=True)
+            # Switch to exploit mode after iteration 4
+            if iteration >= 15 and not use_exploit_mode and no_improvement_counter >= 1:
+                use_exploit_mode = True
+                seen_names = set(top_pool["name"].tolist())
+                bt.logging.info(f"[Miner] Switching to EXPLOIT MODE at iteration {iteration}")
+                print(f"[Miner] Switching to EXPLOIT MODE at iteration {iteration}", flush=True)
 
             # Adaptive n_samples: maintain good throughput
             remaining_time = 1800 - (time.time() - start)
@@ -349,7 +259,7 @@ def main(config: dict):
                 n_samples = int(base_n_samples * 0.80)
 
             # Build synthon library after first iteration
-            if iteration == 4 and not top_pool.empty and synthon_lib is None:
+            if iteration == 2 and not top_pool.empty and synthon_lib is None:
                 try:
                     bt.logging.info("[Miner] Building synthon library from top molecules...")
                     synthon_lib_start = time.time()
@@ -365,8 +275,87 @@ def main(config: dict):
             elite_df = select_diverse_elites(top_pool, min(150, len(top_pool))) if not top_pool.empty else pd.DataFrame()
             elite_names = elite_df["name"].tolist() if not elite_df.empty else None
 
-            # WINNING STRATEGY: Intelligent exploration/exploitation balance
-            if iteration == 1:
+            # EXPLOIT MODE: After iteration 4, use fingerprint exploitation
+            if use_exploit_mode and not top_pool.empty:
+                bt.logging.info(f"[Miner] Iteration {iteration}: EXPLOIT MODE - fingerprint exploitation")
+
+                # Get molecules with unexploited reactants (v4 approach)
+                all_pool_mols = top_pool.to_dict("records")
+                top_mols = get_top_n_unexploited(all_pool_mols, exploited_reactants, n=TOP_N_EXPLOIT)
+
+                if not top_mols:
+                    bt.logging.warning(f"[Miner] All reactants exhausted, falling back to GA")
+                    data = generate_valid_random_molecules_batch(
+                        rxn_id,
+                        n_samples=n_samples,
+                        db_path=DB_PATH,
+                        subnet_config=config,
+                        batch_size=400,
+                        elite_names=elite_names,
+                        elite_frac=elite_frac,
+                        mutation_prob=mutation_prob,
+                        avoid_inchikeys=seen_inchikeys,
+                        component_weights=component_weights,
+                    )
+                else:
+                    print(f"[Miner] Iteration {iteration}: Running EXPLOIT on {len(top_mols)} molecules with unexploited reactants ({len(exploited_reactants)} reactants done)...", flush=True)
+
+                    exploit_start = time.time()
+                    try:
+                        exploit_results, exploit_summary = run_exploit(
+                            top_molecules=top_mols,
+                            db_path=DB_PATH,
+                            rxn_id=rxn_id,
+                            limit_per_reactant=LIMIT_PER_REACTANT,
+                            avoid_names=seen_names,
+                            exploited_reactants=exploited_reactants,
+                            min_heavy_atoms=config.get('min_heavy_atoms', 20),
+                            min_rotatable=config.get('min_rotatable_bonds', 1),
+                            max_rotatable=config.get('max_rotatable_bonds', 10)
+                        )
+
+                        # ALWAYS update exploited reactants (fix tracking bug)
+                        if exploit_summary and 'exploited_reactant_ids' in exploit_summary:
+                            exploited_reactants.update(exploit_summary['exploited_reactant_ids'])
+
+                        exploit_time = time.time() - exploit_start
+                        bt.logging.info(f"[Miner] Exploit returned {len(exploit_results)} candidates in {exploit_time:.1f}s (exploited_reactants={len(exploited_reactants)})")
+
+                        if exploit_results:
+                            data = pd.DataFrame(exploit_results)
+                            seen_names.update(data["name"].tolist())
+                        else:
+                            bt.logging.warning(f"[Miner] Exploit returned no results, falling back to GA")
+                            data = generate_valid_random_molecules_batch(
+                                rxn_id,
+                                n_samples=n_samples,
+                                db_path=DB_PATH,
+                                subnet_config=config,
+                                batch_size=400,
+                                elite_names=elite_names,
+                                elite_frac=elite_frac,
+                                mutation_prob=mutation_prob,
+                                avoid_inchikeys=seen_inchikeys,
+                                component_weights=component_weights,
+                            )
+                    except Exception as e:
+                        bt.logging.error(f"[Miner] Exploit failed: {e}")
+                        print_exc()
+                        data = generate_valid_random_molecules_batch(
+                            rxn_id,
+                            n_samples=n_samples,
+                            db_path=DB_PATH,
+                            subnet_config=config,
+                            batch_size=400,
+                            elite_names=elite_names,
+                            elite_frac=elite_frac,
+                            mutation_prob=mutation_prob,
+                            avoid_inchikeys=seen_inchikeys,
+                            component_weights=component_weights,
+                        )
+
+            # WINNING STRATEGY: Intelligent exploration/exploitation balance (iterations 1-4)
+            elif iteration == 1:
                 print(f"[Miner] Iteration 1: Generating {n_samples_first_iteration} molecules for rxn:{rxn_id}...", flush=True)
                 bt.logging.info(f"[Miner] Iteration {iteration}: Initial broad random sampling")
                 data = generate_valid_random_molecules_batch(
@@ -433,7 +422,7 @@ def main(config: dict):
                     if has_very_high_score or is_very_late_stage:
                         # When we have very high scores, add focused exploitation on TOP 1
                         # Part 1: Ultra-tight on TOP 1 molecule (30% of synthon budget) - OPTIMIZED for high scores
-                        n_synthon_top1 = int(n_samples * 0.26)  # Increased from 0.21 to 0.30 for maximum exploitation
+                        n_synthon_top1 = int(n_samples * 0.25)  # Increased from 0.21 to 0.30 for maximum exploitation
                         synthon_top1_df = generate_molecules_from_synthon_library(
                             synthon_lib,
                             top_pool.head(1),  # TOP 1 ONLY
@@ -771,16 +760,10 @@ def main(config: dict):
                 if len(best_molecules_history) > 6:
                     best_molecules_history.pop(0)
 
-            # Write top 10 for exploit worker every iteration
-            if not top_pool.empty:
-                write_top10_for_exploit_worker(top_pool)
-
             remaining_time = 1800 - (time.time() - start)
             if remaining_time <= 60:
-                # FINAL MERGE: Combine Pool A with Pool B from exploit worker
-                bt.logging.info("[Miner] === FINAL MERGE PHASE ===")
-                pool_b = read_pool_b()
-                top_pool = merge_pools(top_pool, pool_b, config)
+                # FINAL PHASE: Ensure entropy requirements met
+                bt.logging.info("[Miner] === FINAL PHASE ===")
                 entropy = compute_maccs_entropy(top_pool.iloc[:config["num_molecules"]]['smiles'].to_list())
                 if entropy > config['entropy_min_threshold']:
                     top_pool = top_pool.head(config["num_molecules"])
@@ -817,52 +800,27 @@ def main(config: dict):
             iter_total_time = time.time() - iter_start_time
             total_time = time.time() - start
 
-            # Pool A stats
-            pool_a_avg = top_pool['score'].mean()
-            pool_a_max = top_pool['score'].max()
-            pool_a_min = top_pool['score'].min() if len(top_pool) >= 100 else top_pool['score'].min()
+            # Pool stats (unified pool)
+            pool_avg = top_pool['score'].mean()
+            pool_max = top_pool['score'].max()
+            pool_min = top_pool['score'].min() if len(top_pool) >= 100 else top_pool['score'].min()
             try:
-                pool_a_entropy = compute_maccs_entropy(top_pool.head(100)['smiles'].tolist())
+                pool_entropy = compute_maccs_entropy(top_pool.head(100)['smiles'].tolist())
             except:
-                pool_a_entropy = 0.0
+                pool_entropy = 0.0
 
-            # Pool B stats (read current state) and build combined
-            pool_b_avg, pool_b_max, pool_b_entropy, pool_b_size = 0.0, 0.0, 0.0, 0
-            combined_avg, combined_max = pool_a_avg, pool_a_max
-            combined_pool = top_pool  # Default to Pool A only
-            try:
-                pool_b_df = read_pool_b()
-                if not pool_b_df.empty:
-                    pool_b_size = len(pool_b_df)
-                    pool_b_avg = pool_b_df['score'].mean()
-                    pool_b_max = pool_b_df['score'].max()
-                    try:
-                        pool_b_entropy = compute_maccs_entropy(pool_b_df['smiles'].tolist())
-                    except:
-                        pool_b_entropy = 0.0
+            # Write best molecules to result.json
+            top_entries = {"molecules": top_pool["name"].tolist()}
 
-                    # Combined top 100 (Pool A + Pool B)
-                    combined_pool = merge_pools(top_pool.copy(), pool_b_df.copy(), config)
-                    combined_avg = combined_pool['score'].mean()
-                    combined_max = combined_pool['score'].max()
-            except:
-                pass
-
-            # Write combined best molecules to result.json
-            top_entries = {"molecules": combined_pool["name"].tolist()}
-
+            mode_str = "EXPLOIT" if use_exploit_mode else "SYNTHON"
             bt.logging.warning(
                 f"Iter {iteration} | {iter_total_time:.1f}s | Total: {total_time:.0f}s | "
-                f"PoolA: avg={pool_a_avg:.4f} max={pool_a_max:.4f} ent={pool_a_entropy:.3f} | "
-                f"PoolB({pool_b_size}): avg={pool_b_avg:.4f} max={pool_b_max:.4f} ent={pool_b_entropy:.3f} | "
-                f"Combined: avg={combined_avg:.4f} max={combined_max:.4f}"
+                f"Mode: {mode_str} | "
+                f"Pool: avg={pool_avg:.4f} max={pool_max:.4f} ent={pool_entropy:.3f}"
             )
 
             with open(os.path.join(OUTPUT_DIR, "result.json"), "w") as f:
                 json.dump(top_entries, f, ensure_ascii=False, indent=2)
-
-    # Cleanup: stop exploit worker
-    stop_exploit_worker()
 
 
 if __name__ == "__main__":
