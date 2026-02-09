@@ -198,7 +198,7 @@ def main(config: dict):
     # WINNING MODEL: Combines best of richard1220v3 (balanced) + patarcom1 (exploration) + smart adaptations
     # Target: Beat richard1220v3 (0.0124) by 0.05+ to reach 0.0174+
     print(f"[Miner] main() started, rxn={config['allowed_reaction']}", flush=True)
-    base_n_samples = 800  # Optimized: proven pattern for high scores (more iterations, faster learning)
+    base_n_samples = 512  # Optimized: proven pattern for high scores (more iterations, faster learning)
     top_pool = pd.DataFrame(columns=["name", "smiles", "InChIKey", "score", "Target", "Anti"])
     rxn_id = int(config["allowed_reaction"].split(":")[-1])
     print(f"[Miner] rxn_id={rxn_id}", flush=True)
